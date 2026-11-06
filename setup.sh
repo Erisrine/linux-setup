@@ -6,7 +6,7 @@
 #    - Mullvad VPN              (official apt repo, daemon left stopped)
 #    - Vivaldi                  (official .deb + repo, set as default browser)
 #    - Unity Hub                (official apt repo)
-#    - .NET 9 SDK               (Ubuntu dotnet/backports PPA, falls back to dotnet-install.sh)
+#    - .NET 9 SDK               (Microsoft dotnet-install.sh -> /usr/share/dotnet, 9.0.200+ for .slnx)
 #    - VS Code                  (official Microsoft repo + Unity extension)
 #    - Alacritty                (set as default terminal)
 #    - Lotion                   (unofficial Notion desktop app, latest GitHub .deb)
@@ -147,37 +147,69 @@ step_unityhub() {
   apt_install unityhub
 }
 
+# Print the newest installed 9.0 SDK that is 9.0.200+ (needed for .slnx), or nothing.
+dotnet_slnx_sdk() {
+  local bin=${1:-dotnet}
+  "$bin" --list-sdks 2>/dev/null | awk '{ split($1, v, ".") } v[1]==9 && v[2]==0 && v[3]+0>=200 { print $1 }' | tail -n1
+}
+
+# Remove a block previously added by ensure_rc_block.
+remove_rc_block() {
+  local file=$1 marker=$2
+  [[ -f $file ]] && grep -qF "# >>> $marker >>>" "$file" || return 0
+  sed -i "/^# >>> $marker >>>\$/,/^# <<< $marker <<<\$/d" "$file"
+  info "Removed old '$marker' block from $file"
+}
+
 step_dotnet() {
-  log ".NET 9 SDK"
-  if have dotnet && dotnet --list-sdks 2>/dev/null | grep '^9\.' >/dev/null; then
-    info "Already installed: $(dotnet --list-sdks | grep '^9\.' | tail -n1)"
-    return 0
+  log ".NET 9 SDK (Microsoft build, /usr/share/dotnet)"
+  # Ubuntu's own .NET packages (archive and dotnet/backports PPA) only ship the
+  # 9.0.1xx SDK band, which can't read .slnx solutions (needs 9.0.200+). So we
+  # install Microsoft's build system-wide instead, and link it to /usr/bin/dotnet
+  # so GUI apps like VS Code find it without any PATH tweaks.
+  local root=/usr/share/dotnet f
+
+  # 1. Remove Ubuntu-built .NET packages and the backports PPA, if present.
+  local pkgs
+  pkgs=$(dpkg-query -W -f='${Package} ${Status}\n' 'dotnet*' 'aspnetcore*' 'netstandard-targeting-pack*' 2>/dev/null \
+         | awk '/install ok installed/ { print $1 }' || true)
+  if [[ -n $pkgs ]]; then
+    info "Removing Ubuntu .NET packages: $(echo $pkgs)"
+    # shellcheck disable=SC2086
+    sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y -q $pkgs
+  fi
+  if [[ -f /etc/apt/sources.list.d/dotnet-backports.list ]]; then
+    sudo rm -f /etc/apt/sources.list.d/dotnet-backports.list /usr/share/keyrings/dotnet-backports.gpg
+    apt_update
   fi
 
-  # Ubuntu's official .NET backports PPA (Ubuntu 24.04 base has only .NET 8).
-  local codename fp
-  codename=$(. /etc/os-release; echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
-  fp=$(curl -fsSL https://api.launchpad.net/1.0/~dotnet/+archive/ubuntu/backports \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["signing_key_fingerprint"])' 2>/dev/null) \
-     || fp=45A3F127159BE9E5017811C62125B164E8E5D3FA
+  # 2. Drop the PATH/DOTNET_ROOT block an older version of this script may have
+  #    added for ~/.dotnet; it would shadow the system install.
+  while read -r f; do remove_rc_block "$f" "dotnet"; done < <(shell_rc_files)
 
-  if install_key "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x$fp" /usr/share/keyrings/dotnet-backports.gpg \
-     && write_root_file /etc/apt/sources.list.d/dotnet-backports.list \
-          "deb [signed-by=/usr/share/keyrings/dotnet-backports.gpg] https://ppa.launchpadcontent.net/dotnet/backports/ubuntu $codename main" \
-     && apt_update && apt_install dotnet-sdk-9.0; then
-    info "Installed from dotnet/backports PPA: $(dotnet --version)"
-  else
-    warn "PPA install failed; falling back to Microsoft's dotnet-install.sh (~/.dotnet)"
-    sudo rm -f /etc/apt/sources.list.d/dotnet-backports.list
-    curl -fsSLo "$WORK/dotnet-install.sh" https://dot.net/v1/dotnet-install.sh
-    bash "$WORK/dotnet-install.sh" --channel 9.0 --install-dir "$HOME/.dotnet"
-    local f
-    while read -r f; do
-      ensure_rc_block "$f" "dotnet" 'export DOTNET_ROOT="$HOME/.dotnet"
-case ":$PATH:" in *":$HOME/.dotnet:"*) ;; *) export PATH="$HOME/.dotnet:$HOME/.dotnet/tools:$PATH" ;; esac'
-    done < <(shell_rc_files)
-    "$HOME/.dotnet/dotnet" --version
-  fi
+  # 3. Runtime dependencies (package names differ between Ubuntu releases).
+  local deps=(libc6 libgcc-s1 libstdc++6 zlib1g) p
+  for p in libicu74 libicu72 libicu70; do apt-cache show "$p" >/dev/null 2>&1 && { deps+=("$p"); break; }; done
+  for p in libssl3t64 libssl3;          do apt-cache show "$p" >/dev/null 2>&1 && { deps+=("$p"); break; }; done
+  apt_install "${deps[@]}"
+
+  # 4. Install / update to the latest 9.0 SDK. Re-running this step updates it
+  #    (dotnet-install.sh skips the download when that version is already there).
+  curl -fsSLo "$WORK/dotnet-install.sh" https://dot.net/v1/dotnet-install.sh
+  sudo bash "$WORK/dotnet-install.sh" --channel 9.0 --install-dir "$root" --no-path
+  sudo ln -sfn "$root/dotnet" /usr/bin/dotnet
+  sudo mkdir -p /etc/dotnet
+  write_root_file /etc/dotnet/install_location "$root"
+
+  # 5. Global tools (dotnet tool install -g) live in ~/.dotnet/tools.
+  while read -r f; do
+    ensure_rc_block "$f" "dotnet-tools" 'case ":$PATH:" in *":$HOME/.dotnet/tools:"*) ;; *) export PATH="$PATH:$HOME/.dotnet/tools" ;; esac'
+  done < <(shell_rc_files)
+
+  local sdk
+  sdk=$(dotnet_slnx_sdk /usr/bin/dotnet)
+  [[ -n $sdk ]] || die "No .NET 9.0.200+ SDK found after install; check the output above"
+  info "Installed .NET SDK $sdk (supports .slnx). Restart VS Code to pick it up."
 }
 
 step_vscode() {
